@@ -1,0 +1,162 @@
+// botと連携しているチャンネルのID一覧を取得する関数
+const getChannelId = () => {
+
+  const options = {
+    method: "get",
+    contentType: "application/x-www-form-urlencoded",
+    headers: { "Authorization": Bearer ${SLACK_TOKEN} },
+    payload: {
+      exclude_archived: true,
+      limit: 1000, // デフォルトでは100件のみ取得するっぽい
+      types: "public_channel,private_channel",
+    }
+  }
+  
+  // 外部のAPIにHTTPリクエストを送信
+  const response = UrlFetchApp.fetch(GET_CHANNELID_URL, options);
+  const json = JSON.parse(response.getContentText());
+
+  // データが取得できている場合、botが参加しているチャンネルIDを取得する
+  if (json.ok) {
+    
+    const channels = json.channels;
+
+    // 本botが参加しているチャンネルの情報を取得
+    const joinedChannels = channels.filter((channel) => {
+      return channel.is_member ===true;
+    });
+
+    // joinedChannelsから欲しいデータであるチャンネルIDのみを取得
+    const channelIds = joinedChannels.map((channel) => {
+      return channel.id;
+    });
+
+    return channelIds;
+
+  } else {
+    throw new Error('Failed to retriebe channels: ' + json.error);
+  }
+}
+
+// botが連携されているチャンネルでの投稿一覧を取得する関数
+const getAllMessage = (channelIds) => {
+
+  // bot 起動日とその前日のタイムスタンプを取得
+  const today = getSlackTimestamp();
+  const yesterday = (getSlackTimestamp() - 86400);
+
+  //チャンネルIDと取得データの格納配列
+  const messageDataArray = [];
+
+  for (i = 0; i < channelIds.length; i++) {
+
+    const options = {
+      method: "get",
+      contentType: "application/x-www-form-urlencoded",
+      headers: { "Authorization": Bearer ${SLACK_TOKEN} },
+      payload: {
+        channel: channelIds[i],
+        limit: 1000,
+        oldest: yesterday,
+        latest: today,
+        
+      },
+    }
+
+    const response = UrlFetchApp.fetch(GET_MESSAGE_URL, options);
+    const json = JSON.parse(response.getContentText());
+
+    let data = [channelIds[i], json]
+    messageDataArray.push(data);
+  }
+
+  return messageDataArray;
+
+};
+
+// 時刻を取得し、SlackのAPIに渡せる形式となるよう取得時刻を修正する関数（参照用）
+const getSlackTimestamp = () => {
+
+  const date = new Date();
+  const unixTime = Math.floor(date.getTime() / 1000);
+  const millisecond = (date.getMilliseconds() / 1000).toFixed(3).slice(1);
+  const slackTimestamp = unixTime + millisecond;
+
+  return slackTimestamp;
+}
+
+// 投稿後にリアクション及びリプライが無い（ = リプライする必要がある）投稿の情報のみを返す関数
+const getReplyMessage = (messageDataArray) => {
+
+  const replyDataArray = []
+
+  for (let i = 0; i < messageDataArray.length; i ++) {
+
+    let allData = messageDataArray[i];
+    const channelId = allData[0];
+    const data = allData[1];
+
+    data.messages.forEach((message) => {
+
+      // リアクションの有無を確認
+      if (message.reactions !== undefined) {
+
+        message.reactions.forEach((reaction) => {
+
+          // ある場合、リマインドすべきかどうかを判定する。
+          // リアクション"remind"がされていること・返信が無いこと・リアクションが"remind"のみである場合、リマインドすべきであると判定。
+          if (reaction.name === "remind" && message.reply_count === undefined && message.reactions.length === 1) {
+
+            const mentionedUsers = message.text.match(/<@.{11}>/g);
+            const ts = message.ts;
+            const sendUser = message.user;
+            let replyData = [channelId, ts, mentionedUsers, sendUser];
+            replyDataArray.push(replyData);
+            
+          }
+        })
+      }
+    })
+  }
+
+  return replyDataArray;
+
+}
+
+// メッセージ送信用関数
+const doReply = () => {
+  
+  // 各関数を使用し、最終的にリマインドすべき投稿の情報を取得
+  const channelIds = getChannelId();
+  const messageDataArray = getAllMessage(channelIds);
+  const replyDataArray = getReplyMessage(messageDataArray);
+
+  for (i = 0; i < replyDataArray.length; i++) {
+
+    // payloadで渡す変数の定義
+    const sendChannelId = replyDataArray[i][0];
+    const threadTs = replyDataArray[i][1];
+    const mentionedUsers = replyDataArray[i][2];
+    const sendUsers = replyDataArray[i][3];
+    let message = `${mentionedUsers} (<@${sendUsers}>)\nこちら、リマインドしますね:remind_bell:\n私のリマインドは一度きりなので、ご確認をお願いします！`;
+
+    // メンション先が含まれていない場合、投稿者にメンションがされていない旨を連絡
+    if (mentionedUsers === null) {
+      message = `<@${sendUsers}> さん！\nメッセージのメンション先が記載されていないようです:face_in_clouds:`;
+    }
+
+    const options = {
+      method: "post",
+      contentType: "application/x-www-form-urlencoded",
+      headers: { "Authorization": `Bearer ${SLACK_TOKEN}`},
+      payload: {
+        channel: sendChannelId,
+        text: message,
+        thread_ts: threadTs,
+      }
+    }
+
+    //外部のAPIやウェブサイトにHTTPリクエストを送る
+    UrlFetchApp.fetch(POST_MESSAGE_URL, options);
+  }
+}
